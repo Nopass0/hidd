@@ -2,29 +2,47 @@ import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline-sync";
+import * as os from "os";
 
-function log(message: string, color: string = "reset") {
-  const colors: { [key: string]: string } = {
-    green: "\x1b[32m",
-    yellow: "\x1b[33m",
-    red: "\x1b[31m",
-    cyan: "\x1b[36m",
-    reset: "\x1b[0m",
-  };
-  console.log(`${colors[color]}${message}${colors.reset}`);
+interface BuildConfig {
+  platform: string;
+  arch: string;
+  target: string;
+  extension: string;
+  executableName: string;
+}
+
+const COLORS = {
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  cyan: "\x1b[36m",
+  reset: "\x1b[0m",
+} as const;
+
+function log(message: string, color: keyof typeof COLORS = "reset"): void {
+  console.log(`${COLORS[color]}${message}${COLORS.reset}`);
 }
 
 function checkRustInstallation(): boolean {
   try {
     const rustVersion = execSync("rustc --version").toString().trim();
-    log(`Rust уже установлен: ${rustVersion}`, "green");
+    log(`Rust установлен: ${rustVersion}`, "green");
     return true;
   } catch {
     log("Rust не установлен. Устанавливаем...", "yellow");
     try {
-      execSync(
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
-      );
+      if (process.platform === "win32") {
+        execSync(
+          "curl --proto '=https' --tlsv1.2 -sSf https://win.rustup.rs -o rustup-init.exe"
+        );
+        execSync("rustup-init.exe -y");
+        fs.unlinkSync("rustup-init.exe");
+      } else {
+        execSync(
+          "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+        );
+      }
       log("Rust успешно установлен", "green");
       return true;
     } catch (error) {
@@ -34,24 +52,41 @@ function checkRustInstallation(): boolean {
   }
 }
 
-function checkDependencies(): void {
-  const visualStudioPath = path.join(
-    process.env["ProgramFiles(x86)"] || "",
-    "Microsoft Visual Studio",
-    "Installer",
-    "vswhere.exe"
-  );
+function checkCrossDependencies(): void {
+  try {
+    execSync("cross --version");
+  } catch {
+    log("Устанавливаем cross...", "yellow");
+    execSync("cargo install cross");
+  }
+}
 
-  if (!fs.existsSync(visualStudioPath)) {
-    log("Необходимо установить Visual Studio Build Tools.", "yellow");
-    log("Скачиваем Visual Studio Build Tools...");
-
-    const buildToolsUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe";
-    execSync(`curl -o vs_buildtools.exe ${buildToolsUrl}`);
-    execSync(
-      `start /wait vs_buildtools.exe --quiet --wait --norestart --nocache --installPath "C:\\BuildTools" --add Microsoft.VisualStudio.Workload.VCTools`
+function checkPlatformDependencies(): void {
+  if (process.platform === "win32") {
+    const visualStudioPath = path.join(
+      process.env["ProgramFiles(x86)"] || "",
+      "Microsoft Visual Studio",
+      "Installer",
+      "vswhere.exe"
     );
-    fs.unlinkSync("vs_buildtools.exe");
+
+    if (!fs.existsSync(visualStudioPath)) {
+      log("Устанавливаем Visual Studio Build Tools...", "yellow");
+      const buildToolsUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe";
+      execSync(`curl -o vs_buildtools.exe ${buildToolsUrl}`);
+      execSync(
+        `start /wait vs_buildtools.exe --quiet --wait --norestart --nocache ` +
+          `--installPath "C:\\BuildTools" --add Microsoft.VisualStudio.Workload.VCTools`
+      );
+      fs.unlinkSync("vs_buildtools.exe");
+    }
+  } else if (process.platform === "darwin") {
+    try {
+      execSync("xcode-select -p");
+    } catch {
+      log("Устанавливаем Xcode Command Line Tools...", "yellow");
+      execSync("xcode-select --install");
+    }
   }
 }
 
@@ -59,7 +94,6 @@ function getTargetUrl(): string {
   let url: string;
   do {
     url = readline.question("Введите URL для открытия в приложении: ");
-    // Проверка правильности URL
     if (/^https?:\/\//i.test(url)) {
       return url;
     }
@@ -70,59 +104,190 @@ function getTargetUrl(): string {
   } while (true);
 }
 
-function buildProject(url: string): void {
+function updateSourceUrl(url: string): void {
   const mainRsPath = "src/main.rs";
   let mainRs = fs.readFileSync(mainRsPath, "utf-8");
   mainRs = mainRs.replace(/(with_url\(")([^"]+)("\))/g, `$1${url}$3`);
   fs.writeFileSync(mainRsPath, mainRs, { encoding: "utf-8" });
+}
 
-  log("Собираем релизную версию...", "yellow");
-  execSync("cargo build --release");
+function getBuildConfigs(): BuildConfig[] {
+  return [
+    {
+      platform: "windows",
+      arch: "x64",
+      target: "x86_64-pc-windows-msvc",
+      extension: ".exe",
+      executableName: "hidd.exe",
+    },
+    {
+      platform: "darwin",
+      arch: "x64",
+      target: "x86_64-apple-darwin",
+      extension: "",
+      executableName: "hidd",
+    },
+    {
+      platform: "darwin",
+      arch: "arm64",
+      target: "aarch64-apple-darwin",
+      extension: "",
+      executableName: "hidd",
+    },
+  ];
+}
 
-  // Логирование содержимого директории
-  console.log("Содержимое директории target/release:");
-  fs.readdirSync("target/release").forEach((file) => console.log(file));
+async function buildForPlatform(
+  config: BuildConfig,
+  url: string
+): Promise<void> {
+  log(`Сборка для ${config.platform} (${config.arch})...`, "yellow");
 
-  const releaseExePath = "target/release/hidd.exe";
+  const releaseDir = path.join(
+    "release_build",
+    `${config.platform}-${config.arch}`
+  );
+  fs.mkdirSync(releaseDir, { recursive: true });
 
-  // Проверка существования исполняемого файла
-  if (fs.existsSync(releaseExePath)) {
-    const releaseDir = "release_build";
-
-    // Удаляем папку release_build, если она существует
-    if (fs.existsSync(releaseDir)) {
-      fs.rmSync(releaseDir, { recursive: true, force: true });
-      log(`Старая папка ${releaseDir} была удалена.`, "yellow");
+  try {
+    // Use native cargo for Windows builds when on Windows
+    if (process.platform === "win32" && config.platform === "windows") {
+      execSync(`cargo build --target ${config.target} --release`);
+    } else {
+      // Use cross for cross-compilation
+      execSync(`cross build --target ${config.target} --release`);
     }
 
-    // Создаем новую папку release_build
-    fs.mkdirSync(releaseDir, { recursive: true });
-    log(`Создана новая папка ${releaseDir}.`, "green");
+    const sourceFile = path.join(
+      "target",
+      config.target,
+      "release",
+      config.executableName
+    );
 
-    // Копирование исполняемого файла
-    try {
-      fs.copyFileSync(releaseExePath, path.join(releaseDir, "hidd.exe"));
+    const targetFile = path.join(releaseDir, config.executableName);
+
+    if (fs.existsSync(sourceFile)) {
+      fs.copyFileSync(sourceFile, targetFile);
+
+      // Установка прав на выполнение для Unix-подобных систем
+      if (config.platform !== "windows") {
+        fs.chmodSync(targetFile, 0o755);
+      }
+
+      // Создание .app бундла для macOS
+      if (config.platform === "darwin") {
+        createMacOSBundle(releaseDir, config);
+      }
+
       log(
-        `Сборка успешно завершена. Исполняемый файл находится в папке ${releaseDir}`,
+        `Сборка для ${config.platform} (${config.arch}) успешно завершена`,
         "green"
       );
-    } catch (copyError: any) {
-      log(`Ошибка при копировании файла: ${copyError.message}`, "red");
+    } else {
+      throw new Error(`Исполняемый файл не найден: ${sourceFile}`);
     }
-  } else {
-    log("Ошибка при сборке проекта: исполняемый файл не найден", "red");
+  } catch (error) {
+    log(
+      `Ошибка при сборке для ${config.platform} (${config.arch}): ${error}`,
+      "red"
+    );
   }
 }
 
-// Основной скрипт
-log("Начинаем подготовку и сборку проекта...", "cyan");
+function createMacOSBundle(releaseDir: string, config: BuildConfig): void {
+  const appDir = path.join(releaseDir, "Hidd.app");
+  const contentsDir = path.join(appDir, "Contents");
+  const macOSDir = path.join(contentsDir, "MacOS");
+  const resourcesDir = path.join(contentsDir, "Resources");
 
-if (!checkRustInstallation()) {
-  process.exit(1);
+  // Создаем структуру директорий
+  fs.mkdirSync(macOSDir, { recursive: true });
+  fs.mkdirSync(resourcesDir, { recursive: true });
+
+  // Копируем исполняемый файл
+  fs.copyFileSync(
+    path.join(releaseDir, config.executableName),
+    path.join(macOSDir, config.executableName)
+  );
+
+  // Создаем Info.plist
+  const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Hidd</string>
+    <key>CFBundleDisplayName</key>
+    <string>Hidd</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.yourcompany.hidd</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleExecutable</key>
+    <string>${config.executableName}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.11</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>`;
+
+  fs.writeFileSync(path.join(contentsDir, "Info.plist"), infoPlist);
 }
 
-checkDependencies();
-const targetUrl = getTargetUrl();
-buildProject(targetUrl);
+async function main() {
+  log("Начинаем подготовку и сборку проекта...", "cyan");
 
-log("Процесс завершен", "cyan");
+  if (!checkRustInstallation()) {
+    process.exit(1);
+  }
+
+  checkPlatformDependencies();
+  checkCrossDependencies();
+
+  const url = getTargetUrl();
+  updateSourceUrl(url);
+
+  // Очистка директории сборки
+  if (fs.existsSync("release_build")) {
+    fs.rmSync("release_build", { recursive: true, force: true });
+  }
+
+  // Получаем конфигурации для сборки
+  const configs = getBuildConfigs();
+
+  // Собираем для всех платформ
+  for (const config of configs) {
+    await buildForPlatform(config, url);
+  }
+
+  // Создание универсального бинарника для macOS, если собираем на macOS
+  if (process.platform === "darwin") {
+    const macosX64Dir = path.join("release_build", "darwin-x64", "hidd");
+    const macosArmDir = path.join("release_build", "darwin-arm64", "hidd");
+    const universalBinDir = path.join("release_build", "darwin-universal");
+
+    if (fs.existsSync(macosX64Dir) && fs.existsSync(macosArmDir)) {
+      fs.mkdirSync(universalBinDir, { recursive: true });
+      execSync(
+        `lipo -create -output "${path.join(
+          universalBinDir,
+          "hidd"
+        )}" "${macosX64Dir}" "${macosArmDir}"`
+      );
+      log("Создан универсальный бинарник для macOS", "green");
+    }
+  }
+
+  log("Процесс сборки завершен", "cyan");
+}
+
+main().catch((error) => {
+  log(`Произошла ошибка: ${error}`, "red");
+  process.exit(1);
+});

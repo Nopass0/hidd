@@ -1,13 +1,5 @@
 use std::fs;
-use std::path::Path;
 use std::process::Command;
-
-use windows::Win32::Foundation::{LRESULT, WPARAM, LPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowsHookExW, CallNextHookEx, UnhookWindowsHookEx,
-    WH_MOUSE_LL, WH_KEYBOARD_LL, KBDLLHOOKSTRUCT,
-    WM_RBUTTONDOWN, WM_KEYDOWN, HHOOK
-};
 use tao::{
     event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -16,97 +8,140 @@ use tao::{
 };
 use wry::WebViewBuilder;
 
-const VK_F12: u32 = 0x7B;
+#[cfg(target_os = "windows")]
+mod windows_specific {
+    use windows::Win32::Foundation::{LRESULT, WPARAM, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowsHookExW, CallNextHookEx, UnhookWindowsHookEx,
+        WH_MOUSE_LL, WH_KEYBOARD_LL, KBDLLHOOKSTRUCT,
+        WM_RBUTTONDOWN, WM_KEYDOWN, HHOOK
+    };
 
-static mut HOOK_MOUSE: HHOOK = HHOOK(0);
-static mut HOOK_KEYBOARD: HHOOK = HHOOK(0);
+    const VK_F12: u32 = 0x7B;
 
-// Mouse hook procedure
-unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && wparam.0 == WM_RBUTTONDOWN as usize {
-        println!("Правая кнопка мыши заблокирована.");
-        return LRESULT(1); // Block the right mouse button
+    static mut HOOK_MOUSE: HHOOK = HHOOK(0);
+    static mut HOOK_KEYBOARD: HHOOK = HHOOK(0);
+
+    pub unsafe fn setup_hooks() -> Result<(), Box<dyn std::error::Error>> {
+        HOOK_MOUSE = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)?;
+        HOOK_KEYBOARD = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)?;
+
+        if HOOK_MOUSE.0 == 0 || HOOK_KEYBOARD.0 == 0 {
+            return Err("Failed to set hooks.".into());
+        }
+        Ok(())
     }
-    CallNextHookEx(HOOK_MOUSE, code, wparam, lparam)
+
+    pub unsafe fn cleanup_hooks() {
+        UnhookWindowsHookEx(HOOK_MOUSE);
+        UnhookWindowsHookEx(HOOK_KEYBOARD);
+    }
+
+    unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 && wparam.0 == WM_RBUTTONDOWN as usize {
+            println!("Right mouse button blocked.");
+            return LRESULT(1);
+        }
+        CallNextHookEx(HOOK_MOUSE, code, wparam, lparam)
+    }
+
+    unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 {
+            let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            if wparam.0 == WM_KEYDOWN as usize && kb_struct.vkCode == VK_F12 {
+                println!("F12 key blocked.");
+                return LRESULT(1);
+            }
+        }
+        CallNextHookEx(HOOK_KEYBOARD, code, wparam, lparam)
+    }
 }
 
-// Keyboard hook procedure
-unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        if wparam.0 == WM_KEYDOWN as usize && kb_struct.vkCode == VK_F12 {
-            println!("Нажатие F12 заблокировано.");
-            return LRESULT(1); // Block F12 key
+#[cfg(target_os = "macos")]
+mod macos_specific {
+    use objc::{class, msg_send, sel, sel_impl};
+    use objc_foundation::NSObject;
+    use cocoa::base::id;
+    use cocoa::appkit::{NSEvent, NSEventMask};
+
+    pub fn setup_event_monitor() -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let notification_center: id = msg_send![workspace, notificationCenter];
+            
+            // Monitor global events
+            let event_mask = NSEventMask::NSKeyDownMask as usize | 
+                           NSEventMask::NSRightMouseDownMask as usize;
+            
+            let _monitor: id = msg_send![class!(NSEvent),
+                addGlobalMonitorForEventsMatchingMask:event_mask 
+                handler:^(event: id) {
+                    let event_type = NSEvent::eventType(event);
+                    if event_type == NSEventType::NSRightMouseDown {
+                        println!("Right mouse button blocked on macOS");
+                        return;
+                    }
+                    
+                    if event_type == NSEventType::NSKeyDown {
+                        let characters: id = msg_send![event, charactersIgnoringModifiers];
+                        let key_code: u16 = msg_send![event, keyCode];
+                        if key_code == 0x7B { // F12 key
+                            println!("F12 key blocked on macOS");
+                            return;
+                        }
+                    }
+                }
+            ];
+        }
+        Ok(())
+    }
+}
+
+fn cleanup_webview() -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe_path = std::env::current_exe()?;
+        let folder_name = format!("{}.WebView2", exe_path.file_stem().unwrap().to_string_lossy());
+        let folder_path = exe_path.parent().unwrap().join(folder_name);
+
+        if folder_path.exists() {
+            fs::remove_dir_all(&folder_path)?;
+            println!("WebView2 folder removed successfully.");
         }
     }
-    CallNextHookEx(HOOK_KEYBOARD, code, wparam, lparam)
-}
 
-// Function to remove WebView2 folder
-fn remove_webview_folder() -> std::io::Result<()> {
-    // Get the current path to the executable
-    let exe_path = std::env::current_exe()?;
-
-    // Create the path to the folder by adding ".WebView2"
-    let folder_name = format!("{}.WebView2", exe_path.file_stem().unwrap().to_string_lossy());
-    let folder_path = exe_path.parent().unwrap().join(folder_name); // Form the path to the folder in the same directory
-
-    // Check if the folder exists
-    if folder_path.exists() {
-        // Try to remove the folder
-        fs::remove_dir_all(&folder_path)?;
-        println!("Папка {:?} успешно удалена.", folder_path);
-    } else {
-        println!("Папка {:?} не найдена.", folder_path);
+    #[cfg(target_os = "macos")]
+    {
+        // macOS WebKit cache cleanup if needed
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cache_path = format!("{}/Library/Caches/com.yourapp.webview", home);
+        if std::path::Path::new(&cache_path).exists() {
+            fs::remove_dir_all(cache_path)?;
+            println!("WebKit cache removed successfully.");
+        }
     }
 
     Ok(())
 }
 
-// Function to run cleanup script
-fn run_cleanup_script() {
-    // Get the current executable path and unwrap the result
-    let exe_path = std::env::current_exe().unwrap();
-
-    // Create a string from the executable's file stem
-    let exe_name = exe_path.file_stem().unwrap().to_string_lossy();
-
-    // Create the folder name
-    let folder_name = format!("{}.exe.WebView2", exe_name);
-    let folder_path = exe_path.parent().unwrap().join(&folder_name); // Use &folder_name to avoid ownership issues
-
-    let script_path = std::path::Path::new("remove_webview2.ps1");
-
-    let output = Command::new("powershell")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass") // Disable the execution policy for the script
-        .arg("-File")
-        .arg(script_path)
-        .arg(&*exe_name) // Dereference Cow here
-        .arg(&*folder_path.to_string_lossy()) // Dereference Cow here
-        .output()
-        .expect("Не удалось выполнить скрипт");
-
-    if !output.status.success() {
-        eprintln!(
-            "Ошибка выполнения скрипта: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new();
 
-    // Create a non-resizable window with a fixed size
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(800.0, 600.0))
         .with_resizable(false)
         .build(&event_loop)?;
 
-    // Build a webview with initialization scripts
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows_specific::setup_hooks()?;
+    }
+
+    #[cfg(target_os = "macos")]
+    macos_specific::setup_event_monitor()?;
+
     let _webview = WebViewBuilder::new()
-        .with_url("https://google.com")
+        .with_url("https://ya.ru")
         .with_initialization_script(
             "document.addEventListener('contextmenu', event => event.preventDefault());
              window.addEventListener('keydown', function(e) {
@@ -153,37 +188,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  }
              });"
         )
-        .with_devtools(false) // Disable developer tools
+        .with_devtools(false)
         .build(&window)?;
 
-    unsafe {
-        HOOK_MOUSE = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)?;
-        HOOK_KEYBOARD = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)?;
-
-        if HOOK_MOUSE.0 == 0 || HOOK_KEYBOARD.0 == 0 {
-            return Err("Не удалось установить хуки.".into()); // Failed to set hooks
-        }
-    }
-
-    // Run the event loop
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::NewEvents(StartCause::Init) => println!("Wry has started!"),
+            Event::NewEvents(StartCause::Init) => println!("Application started!"),
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
-                .. 
+                ..
             } => {
+                #[cfg(target_os = "windows")]
                 unsafe {
-                    UnhookWindowsHookEx(HOOK_MOUSE);
-                    UnhookWindowsHookEx(HOOK_KEYBOARD);
+                    windows_specific::cleanup_hooks();
                 }
 
-                // Run the cleanup script
-                run_cleanup_script();
+                if let Err(e) = cleanup_webview() {
+                    eprintln!("Error cleaning up WebView: {}", e);
+                }
 
-                *control_flow = ControlFlow::Exit; // Exit the application
+                *control_flow = ControlFlow::Exit;
             },
             _ => (),
         }
